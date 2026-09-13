@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__
+*.pyc
+bot_data.json
+README.md
+supabase_schema.sql
+migrate_json_to_supabase.py
