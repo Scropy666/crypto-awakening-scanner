@@ -36,6 +36,15 @@ MEXC = "https://api.mexc.com"
 HTTP_TIMEOUT = 15.0
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 
+# Stable / fiat-pegged base assets are not useful for pre-pump scanning.
+# Keep this explicit rather than using name heuristics, which could exclude
+# unrelated tokens accidentally.
+STABLECOIN_BASES = {
+    "USDC", "FDUSD", "BUSD", "TUSD", "USDP", "DAI", "USDE", "USDS",
+    "PYUSD", "USD1", "USDD", "USDJ", "USTC", "FRAX", "LUSD", "GHO",
+    "SUSD", "RLUSD", "EURC", "EURI", "AEUR",
+}
+
 # Defaults are deliberately tuned toward the FORM/SOPH pattern:
 # derivatives participation increases before price fully expands.
 DEFAULTS: dict[str, float] = {
@@ -164,6 +173,7 @@ HELP_TEXT = (
     "/unsubscribe — отключить алерты\n"
     "/top — текущий TOP активных сигналов\n"
     "/rawtop — диагностический TOP включая NONE\n"
+    "/stats — статистика сигналов за последние 24 часа\n"
     "/history LSK — дневная история Price/OI для монеты из последнего скана\n"
     "/scan — ручной скан (admin)\n"
     "/settings — текущие параметры\n"
@@ -261,6 +271,21 @@ class Store:
                     pending_downgrade_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_signal_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    event_ts BIGINT NOT NULL,
+                    signal_price DOUBLE PRECISION NOT NULL,
+                    stage TEXT NOT NULL,
+                    score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bot_signal_events_ts_symbol
+                ON bot_signal_events(event_ts DESC, symbol)
             """)
             for key, value in DEFAULTS.items():
                 await conn.execute(
@@ -416,6 +441,30 @@ class Store:
             """,
             symbol, int(time.time()), float(score), stage,
         )
+
+    async def record_signal_event(
+        self, symbol: str, signal_price: float, stage: str, score: float, event_ts: int | None = None
+    ):
+        await self._pool().execute(
+            """
+            INSERT INTO bot_signal_events(symbol, event_ts, signal_price, stage, score)
+            VALUES($1, $2, $3, $4, $5)
+            """,
+            symbol, int(event_ts or time.time()), float(signal_price), stage, float(score),
+        )
+
+    async def first_signal_events_since(self, since_ts: int) -> list[dict[str, Any]]:
+        rows = await self._pool().fetch(
+            """
+            SELECT DISTINCT ON (symbol)
+                symbol, event_ts, signal_price, stage, score
+            FROM bot_signal_events
+            WHERE event_ts >= $1
+            ORDER BY symbol, event_ts ASC, id ASC
+            """,
+            int(since_ts),
+        )
+        return [dict(row) for row in rows]
 
 
 store = Store(DATABASE_URL)
@@ -760,35 +809,57 @@ async def get_json(client: httpx.AsyncClient, url: str, params: dict | None = No
 
 
 async def get_universe(client: httpx.AsyncClient) -> list[str]:
-    """Binance USDT-M perpetuals ∩ active MEXC USDT futures."""
-    b, m = await asyncio.gather(
+    """Strict universe: active Binance USDT-M perpetuals ∩ live MEXC USDT futures.
+
+    MEXC's contract catalogue can contain hidden/stale contracts. Requiring the
+    symbol in both contract/detail (state=0) and the live futures ticker prevents
+    those catalogue-only symbols from leaking into the scanner.
+    """
+    b, m_detail, m_ticker = await asyncio.gather(
         get_json(client, f"{BINANCE}/fapi/v1/exchangeInfo"),
         get_json(client, f"{MEXC}/api/v1/contract/detail"),
+        get_json(client, f"{MEXC}/api/v1/contract/ticker"),
     )
 
-    binance_symbols = {
-        x["symbol"]
-        for x in b.get("symbols", [])
-        if x.get("status") == "TRADING"
-        and x.get("contractType") == "PERPETUAL"
-        and x.get("quoteAsset") == "USDT"
+    binance_symbols: set[str] = set()
+    for x in b.get("symbols", []):
+        base = str(x.get("baseAsset", "")).upper()
+        if (
+            x.get("status") == "TRADING"
+            and x.get("contractType") == "PERPETUAL"
+            and x.get("quoteAsset") == "USDT"
+            and base not in STABLECOIN_BASES
+        ):
+            binance_symbols.add(str(x.get("symbol", "")))
+
+    detail_rows = m_detail.get("data", []) if isinstance(m_detail, dict) else []
+    mexc_enabled: set[str] = set()
+    for x in detail_rows if isinstance(detail_rows, list) else []:
+        sym = str(x.get("symbol", "")).upper()
+        base = str(x.get("baseCoin", "")).upper()
+        if (
+            sym.endswith("_USDT")
+            and x.get("state") in (0, "0")
+            and str(x.get("quoteCoin", "USDT")).upper() == "USDT"
+            and str(x.get("settleCoin", "USDT")).upper() == "USDT"
+            and not bool(x.get("isHidden", False))
+            and base not in STABLECOIN_BASES
+        ):
+            mexc_enabled.add(sym.replace("_", ""))
+
+    ticker_rows = m_ticker.get("data", []) if isinstance(m_ticker, dict) else []
+    if isinstance(ticker_rows, dict):
+        ticker_rows = [ticker_rows]
+    mexc_live = {
+        str(x.get("symbol", "")).upper().replace("_", "")
+        for x in ticker_rows if isinstance(x, dict) and str(x.get("symbol", "")).upper().endswith("_USDT")
     }
 
-    raw = m.get("data", []) if isinstance(m, dict) else []
-    mexc_symbols = set()
-    for x in raw:
-        sym = str(x.get("symbol", ""))
-        if sym.endswith("_USDT"):
-            state = x.get("state")
-            if state in (None, 0, "0"):
-                mexc_symbols.add(sym.replace("_", ""))
-
+    mexc_symbols = mexc_enabled & mexc_live
     overlap = sorted(binance_symbols & mexc_symbols)
     log.info(
-        "Universe: Binance=%d MEXC=%d overlap=%d",
-        len(binance_symbols),
-        len(mexc_symbols),
-        len(overlap),
+        "Universe: Binance=%d MEXC enabled=%d live=%d strict_overlap=%d",
+        len(binance_symbols), len(mexc_enabled), len(mexc_live), len(overlap),
     )
     return overlap
 
@@ -1106,7 +1177,7 @@ async def scan_market() -> list[Signal]:
     async with scan_lock:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "oi-lifecycle-signal-bot/8.1"},
+            headers={"User-Agent": "oi-lifecycle-signal-bot/8.2"},
         ) as client:
             universe = await get_universe(client)
             ticker_map, premium_map = await get_global_market_snapshots(client)
@@ -1269,11 +1340,21 @@ def rejection_reasons(s: Signal, cfg: dict[str, float]) -> list[str]:
     return reasons
 
 
+def is_top_candidate(s: Signal, cfg: dict[str, float]) -> bool:
+    """Pre-move candidate only: remove coins whose price impulse is already underway."""
+    if s.stage == "NONE" or s.stage in {"IGNITION", "EXPANSION"}:
+        return False
+    ignition = cfg["ignition_price_pct"]
+    if s.price_change_pct >= ignition or s.price_24h_pct >= ignition:
+        return False
+    return True
+
+
 def top_text(items: list[Signal], n: int, cfg: dict[str, float]) -> str:
-    active = [s for s in items if s.stage != "NONE"][:n]
+    active = [s for s in items if is_top_candidate(s, cfg)][:10]
     if not active:
-        return "Сейчас нет активных Volume/OI/Velocity сигналов."
-    rows = ["<b>Текущий signal TOP — OI lifecycle + Volume + Velocity</b>\n"]
+        return "Сейчас нет ранних pre-move кандидатов."
+    rows = ["<b>TOP 10 потенциала — только до начала импульса</b>\n"]
     for i, s in enumerate(active, 1):
         squeeze = " | 🩳 SQUEEZE" if s.funding_pct <= cfg["short_squeeze_funding_pct"] else ""
         vol = " | 🟣 VOL" if s.volume_accumulation else ""
@@ -1357,7 +1438,10 @@ def menu_markup(subscribed: bool | None = None):
             InlineKeyboardButton("📊 TOP", callback_data="top"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         ],
-        [InlineKeyboardButton(sub_label, callback_data=sub_data)],
+        [
+            InlineKeyboardButton("📈 24h статистика", callback_data="stats"),
+            InlineKeyboardButton(sub_label, callback_data=sub_data),
+        ],
     ])
 
 
@@ -1477,6 +1561,97 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reschedule_scanner(context.application, value)
 
 
+async def build_stats_24h() -> str:
+    since_ts = int(time.time()) - 24 * 3600
+    events = await store.first_signal_events_since(since_ts)
+    if not events:
+        return (
+            "<b>Статистика сигналов за 24 часа</b>\n\n"
+            "Сохранённых сигналов за последние 24 часа пока нет. "
+            "Статистика начинает накапливаться после установки этой версии."
+        )
+
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT, headers={"User-Agent": "oi-lifecycle-signal-bot/8.2"}
+    ) as client:
+        tickers = await get_json(client, f"{BINANCE}/fapi/v1/ticker/24hr")
+        ticker_map = {x.get("symbol"): x for x in tickers if isinstance(x, dict)}
+        sem = asyncio.Semaphore(min(MAX_CONCURRENCY, 8))
+
+        async def one(event: dict[str, Any]):
+            symbol = str(event["symbol"])
+            start_price = float(event["signal_price"])
+            if start_price <= 0:
+                return None
+            async with sem:
+                try:
+                    klines = await get_json(
+                        client,
+                        f"{BINANCE}/fapi/v1/klines",
+                        {
+                            "symbol": symbol,
+                            "interval": "1m",
+                            "startTime": int(event["event_ts"]) * 1000,
+                            "limit": 1500,
+                        },
+                    )
+                except Exception as exc:
+                    log.debug("Stats klines failed for %s: %s", symbol, exc)
+                    klines = []
+            highs = []
+            closes = []
+            for k in klines if isinstance(klines, list) else []:
+                try:
+                    highs.append(float(k[2]))
+                    closes.append(float(k[4]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+            ticker = ticker_map.get(symbol, {})
+            try:
+                current_price = float(ticker.get("lastPrice", 0) or 0)
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if current_price <= 0 and closes:
+                current_price = closes[-1]
+            peak_price = max([start_price] + highs)
+            peak_pct = max(0.0, pct_change(start_price, peak_price))
+            current_pct = pct_change(start_price, current_price) if current_price > 0 else None
+            return {
+                **event,
+                "peak_pct": peak_pct,
+                "current_pct": current_pct,
+            }
+
+        rows_data = [x for x in await asyncio.gather(*(one(e) for e in events)) if x]
+
+    rows_data.sort(key=lambda x: float(x["peak_pct"]), reverse=True)
+    lines = [
+        "<b>Статистика сигналов за последние 24 часа</b>",
+        "<i>Отсчёт для каждой монеты — от её первого сохранённого сигнала внутри этого 24h окна.</i>",
+        "",
+    ]
+    for i, row in enumerate(rows_data, 1):
+        dt = datetime.fromtimestamp(int(row["event_ts"]), tz=timezone.utc).strftime("%d.%m %H:%M")
+        current = row["current_pct"]
+        current_text = "n/a" if current is None else f"{current:+.1f}%"
+        lines.append(
+            f"<b>{i}. {row['symbol']}</b> — пик <b>+{float(row['peak_pct']):.1f}%</b> | сейчас <b>{current_text}</b>\n"
+            f"первый сигнал: {dt} UTC, {stage_label(str(row['stage']))}, цена {fmt_price(float(row['signal_price']))}"
+        )
+    return "\n\n".join(lines)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await build_stats_24h()
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+    except Exception as exc:
+        log.exception("24h stats failed")
+        await update.effective_message.reply_text(f"Ошибка статистики: {type(exc).__name__}: {exc}")
+
+
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = await store.settings()
     items = latest_top
@@ -1592,6 +1767,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             top_text(latest_top, int(cfg["top_n"]), cfg), parse_mode=ParseMode.HTML
         )
+    elif q.data == "stats":
+        try:
+            await q.message.reply_text(
+                await build_stats_24h(), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+        except Exception as exc:
+            log.exception("24h stats callback failed")
+            await q.message.reply_text(f"Ошибка статистики: {type(exc).__name__}: {exc}")
 
 
 async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
@@ -1637,6 +1820,10 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
 
             if delivered:
                 await store.mark_alert(s.symbol, effective_score(s), s.stage)
+                if event_type != "downgrade" and should_alert(s):
+                    await store.record_signal_event(
+                        s.symbol, s.price, s.stage, effective_score(s)
+                    )
 
     except Exception:
         log.exception("Scheduled scan failed")
@@ -1666,6 +1853,7 @@ async def post_init(app: Application):
             ("unsubscribe", "отписаться"),
             ("top", "TOP активных сигналов"),
             ("rawtop", "диагностика включая NONE"),
+            ("stats", "статистика сигналов за 24 часа"),
             ("history", "Price/OI history + OI Velocity"),
             ("settings", "показать параметры"),
             ("scan", "ручной скан (admin)"),
@@ -1702,6 +1890,7 @@ def main():
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("rawtop", cmd_rawtop))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CallbackQueryHandler(callback))
