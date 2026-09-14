@@ -75,7 +75,11 @@ DEFAULTS: dict[str, float] = {
     "volume_accum_max_abs_price_pct": 8.0,
     "volume_accum_min_oi_change_pct": -10.0,
     "volume_accum_watch_score": 65.0,
-    # v8: intraday OI Velocity detector.
+    # v8.1: intraday OI Velocity detector + 15m shock path.
+    "oi_velocity_15m_pct": 3.0,
+    "oi_velocity_15m_max_abs_price_pct": 3.0,
+    "oi_velocity_15m_divergence_pct": 5.0,
+    "oi_velocity_15m_divergence_max_abs_price_pct": 2.0,
     "oi_velocity_1h_pct": 5.0,
     "oi_velocity_4h_pct": 10.0,
     "oi_velocity_24h_pct": 20.0,
@@ -123,6 +127,10 @@ EDITABLE = {
     "volaccumprice": "volume_accum_max_abs_price_pct",
     "volaccumoi": "volume_accum_min_oi_change_pct",
     "volaccumscore": "volume_accum_watch_score",
+    "velocity15m": "oi_velocity_15m_pct",
+    "velocity15mprice": "oi_velocity_15m_max_abs_price_pct",
+    "velocity15mstrong": "oi_velocity_15m_divergence_pct",
+    "velocity15mstrongprice": "oi_velocity_15m_divergence_max_abs_price_pct",
     "velocity1h": "oi_velocity_1h_pct",
     "velocity4h": "oi_velocity_4h_pct",
     "velocity24h": "oi_velocity_24h_pct",
@@ -142,10 +150,10 @@ HELP_TEXT = (
     "<b>FORM/SOPH Signal Bot</b>\n\n"
     "Сканирует Binance USDT-M perpetuals, которые одновременно имеют MEXC futures. "
     "Главная идея: искать рост участия в деривативах до полного движения цены — "
-    "OI/Price divergence, OI Efficiency, устойчивый рост OI и OI Shock. Параллельно работают Volume Accumulation detector и OI Velocity 1h/4h/24h для быстрых PUNDIX-подобных пробуждений.\n\n"
+    "OI/Price divergence, OI Efficiency, устойчивый рост OI и OI Shock. Параллельно работают Volume Accumulation detector и OI Velocity 15m/1h/4h/24h для быстрых PUNDIX/AIN-подобных пробуждений.\n\n"
     "<b>Стадии</b>\n"
     "🟣 VOLUME WATCH — объём резко вырос, пока цена почти стоит и OI не разваливается\n"
-    "⚡ VELOCITY WATCH — OI резко ускорился за 1h/4h/24h\n"
+    "⚡ VELOCITY WATCH — OI резко ускорился за 15m/1h/4h/24h\n"
     "⚡🔥 FAST AWAKENING — OI Velocity подтверждён контекстом\n"
     "🟡 WATCH — раннее расхождение OI и цены\n"
     "🟠 AWAKENING — подтверждённое накопление OI до импульса\n"
@@ -189,6 +197,10 @@ class Signal:
     volume_ratio: float
     volume_score: float
     volume_accumulation: bool
+    oi_velocity_15m_pct: float
+    price_15m_pct: float | None
+    oi_15m_shock: bool
+    oi_15m_divergence: bool
     oi_velocity_1h_pct: float
     oi_velocity_4h_pct: float
     oi_velocity_24h_pct: float
@@ -590,6 +602,57 @@ def oi_change_over_hours(oi_hist: list[dict[str, Any]], hours: float) -> float:
     return pct_change(start_value, end_value)
 
 
+def oi_change_last_interval(oi_hist: list[dict[str, Any]], expected_minutes: int = 15) -> float:
+    """Percent OI change between the two latest snapshots when spacing is plausible."""
+    points: list[tuple[int, float]] = []
+    for item in oi_hist:
+        try:
+            ts = int(item.get("timestamp", 0))
+            value = float(item.get("sumOpenInterestValue", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts > 0 and value > 0:
+            points.append((ts, value))
+    if len(points) < 2:
+        return 0.0
+    points.sort(key=lambda x: x[0])
+    (start_ts, start_value), (end_ts, end_value) = points[-2], points[-1]
+    spacing_min = (end_ts - start_ts) / 60000.0
+    if spacing_min < expected_minutes * 0.5 or spacing_min > expected_minutes * 2.0:
+        return 0.0
+    return pct_change(start_value, end_value)
+
+
+def latest_closed_15m_price_change(klines_15m: list[list[Any]]) -> float | None:
+    """Open→close move of the latest fully closed 15m candle."""
+    if len(klines_15m) < 2:
+        return None
+    try:
+        candle = klines_15m[-2]  # final element is normally the live/incomplete candle
+        open_price = float(candle[1])
+        close_price = float(candle[4])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if open_price <= 0:
+        return None
+    return pct_change(open_price, close_price)
+
+
+def classify_oi_15m_shock(*, oi_15m: float, price_15m: float | None, cfg: dict[str, float]) -> tuple[bool, bool]:
+    """Early anomaly detector; intentionally does not imply long/short direction."""
+    if price_15m is None:
+        return False, False
+    shock = (
+        oi_15m >= cfg["oi_velocity_15m_pct"]
+        and abs(price_15m) <= cfg["oi_velocity_15m_max_abs_price_pct"]
+    )
+    divergence = (
+        oi_15m >= cfg["oi_velocity_15m_divergence_pct"]
+        and abs(price_15m) <= cfg["oi_velocity_15m_divergence_max_abs_price_pct"]
+    )
+    return shock, divergence
+
+
 def score_oi_velocity(oi_1h: float, oi_4h: float, oi_24h: float, cfg: dict[str, float]) -> float:
     thresholds = [
         max(cfg["oi_velocity_1h_pct"], 0.01),
@@ -830,11 +893,16 @@ async def analyze_symbol(
 
     async with sem:
         try:
-            klines, oi_hist, oi_intraday = await asyncio.gather(
+            klines, klines_15m, oi_hist, oi_intraday = await asyncio.gather(
                 get_json(
                     client,
                     f"{BINANCE}/fapi/v1/klines",
                     {"symbol": symbol, "interval": "1d", "limit": kline_limit},
+                ),
+                get_json(
+                    client,
+                    f"{BINANCE}/fapi/v1/klines",
+                    {"symbol": symbol, "interval": "15m", "limit": 3},
                 ),
                 get_json(
                     client,
@@ -868,6 +936,11 @@ async def analyze_symbol(
     closed = klines[:-1] if len(klines) > 1 else klines
     current_price = float(ticker.get("lastPrice", klines[-1][4]))
     price_24h = float(ticker.get("priceChangePercent", 0) or 0)
+    oi_velocity_15m = oi_change_last_interval(oi_intraday, 15)
+    price_15m = latest_closed_15m_price_change(klines_15m)
+    oi_15m_shock, oi_15m_divergence = classify_oi_15m_shock(
+        oi_15m=oi_velocity_15m, price_15m=price_15m, cfg=cfg
+    )
     oi_velocity_1h = oi_change_over_hours(oi_intraday, 1)
     oi_velocity_4h = oi_change_over_hours(oi_intraday, 4)
     oi_velocity_24h = oi_change_over_hours(oi_intraday, 24)
@@ -925,11 +998,19 @@ async def analyze_symbol(
     )
 
     velocity_score = score_oi_velocity(oi_velocity_1h, oi_velocity_4h, oi_velocity_24h, cfg)
+    # A 15m shock is intentionally surfaced immediately, without waiting for 1h confirmation.
+    # Score floors keep the anomaly visible in /top sorting, but FAST_AWAKENING still requires
+    # the established 1h/4h/24h confirmation logic.
+    if oi_15m_shock:
+        velocity_score = max(velocity_score, 70.0)
+    if oi_15m_divergence:
+        velocity_score = max(velocity_score, 85.0)
     velocity_watch, fast_awakening = classify_oi_velocity(
         oi_1h=oi_velocity_1h, oi_4h=oi_velocity_4h, oi_24h=oi_velocity_24h,
         velocity_score=velocity_score, price_24h=price_24h, volume_ratio=volume_ratio,
         funding_pct=funding_pct, cfg=cfg,
     )
+    velocity_watch = velocity_watch or oi_15m_shock
 
     # ATR compression and historical volatility proxy.
     trs = true_ranges(closed)
@@ -960,15 +1041,6 @@ async def analyze_symbol(
         oi_efficiency=oi_efficiency,
         persistence_ratio=persistence_ratio,
         volume_ratio=volume_ratio,
-        volume_score=volume_score,
-        volume_accumulation=volume_accumulation,
-        oi_velocity_1h_pct=oi_velocity_1h,
-        oi_velocity_4h_pct=oi_velocity_4h,
-        oi_velocity_24h_pct=oi_velocity_24h,
-        velocity_score=velocity_score,
-        velocity_watch=velocity_watch,
-        fast_awakening=fast_awakening,
-        price_24h_pct=price_24h,
         funding_pct=funding_pct,
         compression_ratio=compression_ratio,
         distance_to_breakout_pct=distance_to_breakout_pct,
@@ -1003,6 +1075,17 @@ async def analyze_symbol(
         volume_ratio=volume_ratio,
         volume_score=volume_score,
         volume_accumulation=volume_accumulation,
+        oi_velocity_15m_pct=oi_velocity_15m,
+        price_15m_pct=price_15m,
+        oi_15m_shock=oi_15m_shock,
+        oi_15m_divergence=oi_15m_divergence,
+        oi_velocity_1h_pct=oi_velocity_1h,
+        oi_velocity_4h_pct=oi_velocity_4h,
+        oi_velocity_24h_pct=oi_velocity_24h,
+        velocity_score=velocity_score,
+        velocity_watch=velocity_watch,
+        fast_awakening=fast_awakening,
+        price_24h_pct=price_24h,
         funding_pct=funding_pct,
         compression_ratio=compression_ratio,
         quote_volume=quote_volume,
@@ -1023,7 +1106,7 @@ async def scan_market() -> list[Signal]:
     async with scan_lock:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "oi-lifecycle-signal-bot/8.0"},
+            headers={"User-Agent": "oi-lifecycle-signal-bot/8.1"},
         ) as client:
             universe = await get_universe(client)
             ticker_map, premium_map = await get_global_market_snapshots(client)
@@ -1105,11 +1188,17 @@ def signal_text(s: Signal, cfg: dict[str, float]) -> str:
     shock = "\n⚡ <b>OI SHOCK</b>" if s.oi_change_pct >= cfg["oi_shock_pct"] and s.oi_efficiency >= cfg["oi_shock_efficiency"] else ""
     squeeze = "\n🩳 <b>SHORT-SQUEEZE POTENTIAL</b>" if s.funding_pct <= cfg["short_squeeze_funding_pct"] else ""
     vol_badge = "\n🟣 <b>VOLUME ACCUMULATION</b>" if s.volume_accumulation else ""
+    if s.oi_15m_divergence:
+        velocity15 = "\n🔥 <b>OI 15M DIVERGENCE</b>"
+    elif s.oi_15m_shock:
+        velocity15 = "\n⚡ <b>OI 15M SHOCK</b>"
+    else:
+        velocity15 = ""
     velocity = "\n⚡ <b>OI VELOCITY</b>" if s.velocity_watch else ""
     independent_hits = int(s.volume_accumulation) + int(s.velocity_watch) + int(s.stage in {"WATCH", "AWAKENING", "HIGH", "IGNITION", "EXPANSION"})
     conviction = "\n🔴 <b>HIGH CONVICTION: MULTI-SIGNAL</b>" if independent_hits >= 2 else ""
     return (
-        f"{stage_label(s.stage)} <b>{s.symbol}</b>{shock}{squeeze}{vol_badge}{velocity}{conviction}\n\n"
+        f"{stage_label(s.stage)} <b>{s.symbol}</b>{shock}{squeeze}{vol_badge}{velocity15}{velocity}{conviction}\n\n"
         f"OI Score: <b>{s.score:.1f}/100</b>\n"
         f"Цена: <b>{fmt_price(s.price)}</b>\n"
         f"OI change: <b>{s.oi_change_pct:+.1f}%</b>\n"
@@ -1119,7 +1208,8 @@ def signal_text(s: Signal, cfg: dict[str, float]) -> str:
         f"Volume awakening: <b>{s.volume_ratio:.2f}×</b>\n"
         f"Volume Score: <b>{s.volume_score:.1f}/100</b>\n"
         f"Velocity Score: <b>{s.velocity_score:.1f}/100</b>\n"
-        f"OI Velocity: <b>1h {s.oi_velocity_1h_pct:+.1f}% | 4h {s.oi_velocity_4h_pct:+.1f}% | 24h {s.oi_velocity_24h_pct:+.1f}%</b>\n"
+        f"OI Velocity: <b>15m {s.oi_velocity_15m_pct:+.1f}% | 1h {s.oi_velocity_1h_pct:+.1f}% | 4h {s.oi_velocity_4h_pct:+.1f}% | 24h {s.oi_velocity_24h_pct:+.1f}%</b>\n"
+        f"Price 15m: <b>{'n/a' if s.price_15m_pct is None else f'{s.price_15m_pct:+.2f}%'}</b>\n"
         f"Price 24h: <b>{s.price_24h_pct:+.1f}%</b>\n"
         f"Funding: <b>{s.funding_pct:+.4f}%</b>\n"
         f"Compression: <b>{s.compression_ratio:.2f}×</b>\n"
@@ -1193,7 +1283,7 @@ def top_text(items: list[Signal], n: int, cfg: dict[str, float]) -> str:
             f"<b>{i}. {s.symbol}</b> — {stage_label(s.stage)} — OI {s.score:.1f} | VOL {s.volume_score:.1f} | VEL {s.velocity_score:.1f}{squeeze}{vol}{vel}{combo}\n"
             f"OI {s.oi_change_pct:+.1f}% | Eff {s.oi_efficiency:.2f}× | "
             f"Persist {s.persistence_up_days}/{s.persistence_total_days} | Vol {s.volume_ratio:.2f}×\n"
-            f"Vel 1h {s.oi_velocity_1h_pct:+.1f}% / 4h {s.oi_velocity_4h_pct:+.1f}% / 24h {s.oi_velocity_24h_pct:+.1f}%\n"
+            f"Vel 15m {s.oi_velocity_15m_pct:+.1f}% (Px {'n/a' if s.price_15m_pct is None else f'{s.price_15m_pct:+.1f}%'}) / 1h {s.oi_velocity_1h_pct:+.1f}% / 4h {s.oi_velocity_4h_pct:+.1f}% / 24h {s.oi_velocity_24h_pct:+.1f}%\n"
             f"Price {s.price_change_pct:+.1f}% (24h {s.price_24h_pct:+.1f}%) | Fund {s.funding_pct:+.4f}% | "
             f"Comp {s.compression_ratio:.2f}× | HighDist {s.distance_to_breakout_pct:.1f}%"
         )
@@ -1216,7 +1306,7 @@ def raw_top_text(items: list[Signal], n: int, cfg: dict[str, float]) -> str:
             f"<b>{i}. {s.symbol}</b> — {stage_label(s.stage)} — OI {s.score:.1f} | VOL {s.volume_score:.1f} | VEL {s.velocity_score:.1f}{' | 🟣 VOL' if s.volume_accumulation else ''}{' | ⚡ VEL' if s.velocity_watch else ''}\n"
             f"OI {s.oi_change_pct:+.1f}% | Eff {s.oi_efficiency:.2f}× | "
             f"Persist {s.persistence_up_days}/{s.persistence_total_days} | Vol {s.volume_ratio:.2f}×\n"
-            f"Vel 1h {s.oi_velocity_1h_pct:+.1f}% / 4h {s.oi_velocity_4h_pct:+.1f}% / 24h {s.oi_velocity_24h_pct:+.1f}%\n"
+            f"Vel 15m {s.oi_velocity_15m_pct:+.1f}% (Px {'n/a' if s.price_15m_pct is None else f'{s.price_15m_pct:+.1f}%'}) / 1h {s.oi_velocity_1h_pct:+.1f}% / 4h {s.oi_velocity_4h_pct:+.1f}% / 24h {s.oi_velocity_24h_pct:+.1f}%\n"
             f"Price {s.price_change_pct:+.1f}% (24h {s.price_24h_pct:+.1f}%) | Fund {s.funding_pct:+.4f}% | "
             f"Comp {s.compression_ratio:.2f}× | HighDist {s.distance_to_breakout_pct:.1f}%"
             f"{extra}"
@@ -1230,6 +1320,7 @@ def settings_text(cfg: dict[str, float]) -> str:
         f"OI change ≥ <b>{cfg['oi_change_pct']:.2f}%</b> / {int(cfg['oi_lookback_days'])}d\n"
         f"Volume reference: <b>{cfg['volume_ratio']:.2f}×</b> / high <b>{cfg['high_volume_ratio']:.2f}×</b> (OI score context)\n"
         f"🟣 Volume Accumulation: Vol ≥ <b>{cfg['volume_accum_ratio']:.1f}×</b>, |Price| ≤ <b>{cfg['volume_accum_max_abs_price_pct']:.1f}%</b>, OI ≥ <b>{cfg['volume_accum_min_oi_change_pct']:.1f}%</b>, Volume Score ≥ <b>{cfg['volume_accum_watch_score']:.0f}</b>\n"
+        f"⚡ 15m OI Shock: OI ≥ <b>{cfg['oi_velocity_15m_pct']:.1f}%</b> при |Price 15m| ≤ <b>{cfg['oi_velocity_15m_max_abs_price_pct']:.1f}%</b>; strong ≥ <b>{cfg['oi_velocity_15m_divergence_pct']:.1f}%</b> при |Price| ≤ <b>{cfg['oi_velocity_15m_divergence_max_abs_price_pct']:.1f}%</b>\n"
         f"⚡ OI Velocity: 1h ≥ <b>{cfg['oi_velocity_1h_pct']:.1f}%</b>, 4h ≥ <b>{cfg['oi_velocity_4h_pct']:.1f}%</b>, 24h ≥ <b>{cfg['oi_velocity_24h_pct']:.1f}%</b>; WATCH ≥ <b>{cfg['oi_velocity_watch_score']:.0f}</b>, FAST ≥ <b>{cfg['oi_velocity_fast_score']:.0f}</b>\n"
         f"Velocity FAST context: |Price 24h| ≤ <b>{cfg['oi_velocity_max_abs_price_24h_pct']:.1f}%</b>, Vol ≥ <b>{cfg['oi_velocity_confirmation_volume_ratio']:.1f}×</b> or ≥2 horizons\n"
         f"Late-move hard limit: Price ≤ <b>{cfg['late_move_price_pct']:.2f}%</b>\n"
@@ -1333,6 +1424,14 @@ def validate_setting(key: str, value: float, cfg: dict[str, float]) -> str | Non
         return "squeezefunding должен быть отрицательным, например -0.03."
     if key == "volume_accum_min_oi_change_pct" and value > 0:
         return "volaccumoi обычно должен быть ≤ 0: это допустимое падение OI, например -10."
+    if key == "oi_velocity_15m_divergence_pct" and value < cfg.get("oi_velocity_15m_pct", DEFAULTS["oi_velocity_15m_pct"]):
+        return "velocity15mstrong должен быть ≥ velocity15m."
+    if key == "oi_velocity_15m_pct" and value > cfg.get("oi_velocity_15m_divergence_pct", DEFAULTS["oi_velocity_15m_divergence_pct"]):
+        return "velocity15m должен быть ≤ velocity15mstrong."
+    if key == "oi_velocity_15m_divergence_max_abs_price_pct" and value > cfg.get("oi_velocity_15m_max_abs_price_pct", DEFAULTS["oi_velocity_15m_max_abs_price_pct"]):
+        return "velocity15mstrongprice должен быть ≤ velocity15mprice."
+    if key == "oi_velocity_15m_max_abs_price_pct" and value < cfg.get("oi_velocity_15m_divergence_max_abs_price_pct", DEFAULTS["oi_velocity_15m_divergence_max_abs_price_pct"]):
+        return "velocity15mprice должен быть ≥ velocity15mstrongprice."
     if key in {"watch_score", "awakening_score", "high_score", "volume_accum_watch_score", "oi_velocity_watch_score", "oi_velocity_fast_score"} and value > 100:
         return "Score должен быть в диапазоне 0..100."
     return None
@@ -1433,7 +1532,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"{stage_label(item.stage)} <b>{item.symbol}</b> — OI <b>{item.score:.1f}</b> | Volume <b>{item.volume_score:.1f}</b> | Velocity <b>{item.velocity_score:.1f}</b>\n"
         f"OI change <b>{item.oi_change_pct:+.1f}%</b> | Price change <b>{item.price_change_pct:+.1f}%</b> | Eff <b>{item.oi_efficiency:.2f}×</b>\n"
-        f"OI Velocity: <b>1h {item.oi_velocity_1h_pct:+.1f}% | 4h {item.oi_velocity_4h_pct:+.1f}% | 24h {item.oi_velocity_24h_pct:+.1f}%</b>\n\n"
+        f"OI Velocity: <b>15m {item.oi_velocity_15m_pct:+.1f}% | 1h {item.oi_velocity_1h_pct:+.1f}% | 4h {item.oi_velocity_4h_pct:+.1f}% | 24h {item.oi_velocity_24h_pct:+.1f}%</b>\n"
+        f"Price 15m: <b>{'n/a' if item.price_15m_pct is None else f'{item.price_15m_pct:+.2f}%'}</b>\n\n"
         f"{history_text(item, cfg)}{reason_text}",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
