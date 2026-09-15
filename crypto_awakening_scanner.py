@@ -1566,13 +1566,12 @@ async def build_stats_24h() -> str:
     events = await store.first_signal_events_since(since_ts)
     if not events:
         return (
-            "<b>Статистика сигналов за 24 часа</b>\n\n"
-            "Сохранённых сигналов за последние 24 часа пока нет. "
-            "Статистика начинает накапливаться после установки этой версии."
+            "<b>📊 Сигналы за 24ч</b>\n"
+            "Сохранённых сигналов пока нет. Статистика накапливается после установки v8.2+."
         )
 
     async with httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT, headers={"User-Agent": "oi-lifecycle-signal-bot/8.2"}
+        timeout=HTTP_TIMEOUT, headers={"User-Agent": "oi-lifecycle-signal-bot/8.3"}
     ) as client:
         tickers = await get_json(client, f"{BINANCE}/fapi/v1/ticker/24hr")
         ticker_map = {x.get("symbol"): x for x in tickers if isinstance(x, dict)}
@@ -1616,37 +1615,55 @@ async def build_stats_24h() -> str:
             peak_price = max([start_price] + highs)
             peak_pct = max(0.0, pct_change(start_price, peak_price))
             current_pct = pct_change(start_price, current_price) if current_price > 0 else None
-            return {
-                **event,
-                "peak_pct": peak_pct,
-                "current_pct": current_pct,
-            }
+            return {**event, "peak_pct": peak_pct, "current_pct": current_pct}
 
         rows_data = [x for x in await asyncio.gather(*(one(e) for e in events)) if x]
 
     rows_data.sort(key=lambda x: float(x["peak_pct"]), reverse=True)
     lines = [
-        "<b>Статистика сигналов за последние 24 часа</b>",
-        "<i>Отсчёт для каждой монеты — от её первого сохранённого сигнала внутри этого 24h окна.</i>",
-        "",
+        f"<b>📊 Сигналы за 24ч — {len(rows_data)} монет</b>",
+        "<code>Тикер       Пик     Сейчас</code>",
     ]
-    for i, row in enumerate(rows_data, 1):
-        dt = datetime.fromtimestamp(int(row["event_ts"]), tz=timezone.utc).strftime("%d.%m %H:%M")
+    for row in rows_data:
+        symbol = str(row["symbol"]).removesuffix("USDT")
         current = row["current_pct"]
-        current_text = "n/a" if current is None else f"{current:+.1f}%"
-        lines.append(
-            f"<b>{i}. {row['symbol']}</b> — пик <b>+{float(row['peak_pct']):.1f}%</b> | сейчас <b>{current_text}</b>\n"
-            f"первый сигнал: {dt} UTC, {stage_label(str(row['stage']))}, цена {fmt_price(float(row['signal_price']))}"
-        )
-    return "\n\n".join(lines)
+        current_text = "  n/a" if current is None else f"{current:+6.1f}%"
+        peak_text = f"{float(row['peak_pct']):+6.1f}%"
+        lines.append(f"<code>{symbol[:10]:<10} {peak_text} {current_text}</code>")
+
+    return "\n".join(lines)
+
+
+async def send_html_chunks(message, text: str, max_chars: int = 3900):
+    """Send HTML text safely below Telegram's 4096-character limit."""
+    if len(text) <= max_chars:
+        await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    lines = text.splitlines()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        add_len = len(line) + (1 if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+
+    for chunk in chunks:
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await build_stats_24h()
-        await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
+        await send_html_chunks(update.effective_message, text)
     except Exception as exc:
         log.exception("24h stats failed")
         await update.effective_message.reply_text(f"Ошибка статистики: {type(exc).__name__}: {exc}")
@@ -1769,9 +1786,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif q.data == "stats":
         try:
-            await q.message.reply_text(
-                await build_stats_24h(), parse_mode=ParseMode.HTML, disable_web_page_preview=True
-            )
+            await send_html_chunks(q.message, await build_stats_24h())
         except Exception as exc:
             log.exception("24h stats callback failed")
             await q.message.reply_text(f"Ошибка статистики: {type(exc).__name__}: {exc}")
